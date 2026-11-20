@@ -1,0 +1,36 @@
+{
+  "item.crystal_ball.crystal_ball": "Crystal Ball",
+  "key.categories.crystal_ball": "Crystal Ball",
+  "key.crystal_ball.alpha": "Alpha - Look Back at Myself",
+  "key.crystal_ball.beta": "Beta - Look at the Next Player",
+
+  "crystal_ball.message.reflection": "You see only your own reflection in the orb.",
+  "crystal_ball.message.alone": "There is only you...",
+  "crystal_ball.message.now_watching": "Your gaze turns to %s...",
+  "crystal_ball.message.returned": "You pull your gaze back.",
+  "crystal_ball.message.already_self": "You are already looking at yourself.",
+  "crystal_ball.message.self_target": "You cannot watch yourself.",
+  "crystal_ball.message.not_watchable": "%s cannot be watched right now.",
+  "crystal_ball.message.cycle": "You cannot watch %s, they are already watching you (directly or indirectly).",
+  "crystal_ball.message.other_dimension": "%s is in another dimension. The view cannot follow without leaving your body, so it was cancelled.",
+  "crystal_ball.message.same_dimension_none": "There is nobody else in your dimension to look at.",
+  "crystal_ball.message.out_of_range": "The view of %s is still being streamed to your client, please wait...",
+  "crystal_ball.message.target_left": "%s is no longer there. The view returned to you.",
+  "crystal_ball.message.not_watching": "You are not watching anybody.",
+  "crystal_ball.message.stopped": "Stopped watching.",
+  "crystal_ball.message.damaged": "The Crystal Ball slipped from your hand after you were hurt.",
+  "crystal_ball.message.no_permission": "You do not have permission to do that (permission level %s required).",
+
+  "crystal_ball.message.viewers_none": "Nobody is watching you right now.",
+  "crystal_ball.message.viewers_header": "%s player(s) are watching you:",
+  "crystal_ball.message.viewers_entry": " - %s",
+
+  "crystal_ball.message.relations_none": "There are no watching relations right now.",
+  "crystal_ball.message.relations_header": "%s watching relation(s):",
+  "crystal_ball.message.relations_entry": "%s  ->  %s",
+
+  "crystal_ball.message.permission_get": "Permission level of /crystalball %s: %s",
+  "crystal_ball.message.permission_set": "Permission level of /crystalball %s is now %s.",
+  "crystal_ball.message.permission_reset": "The permission levels of /crystalball watch, stop and viewers were reset to %s.",
+  "crystal_ball.command.permission.unknown": "Unknown command name: %s (expected watch, stop or viewers)"
+}

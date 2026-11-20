@@ -1,0 +1,36 @@
+{
+  "item.crystal_ball.crystal_ball": "占卜球",
+  "key.categories.crystal_ball": "占卜球",
+  "key.crystal_ball.alpha": "α - 视线回到自身",
+  "key.crystal_ball.beta": "β - 看向下一位玩家",
+
+  "crystal_ball.message.reflection": "你在球体中看到的只是你自己的倒影。",
+  "crystal_ball.message.alone": "只有你一个人……",
+  "crystal_ball.message.now_watching": "你的视线投向了 %s……",
+  "crystal_ball.message.returned": "你收回了视线。",
+  "crystal_ball.message.already_self": "你正看着你自己。",
+  "crystal_ball.message.self_target": "你不能观察你自己。",
+  "crystal_ball.message.not_watchable": "现在无法观察 %s。",
+  "crystal_ball.message.cycle": "你无法观察 %s,对方正在(直接或间接地)观察你。",
+  "crystal_ball.message.other_dimension": "%s 在另一个维度。不离开原地就无法把视线投过去,观察已取消。",
+  "crystal_ball.message.same_dimension_none": "你所在的维度里没有其他人可以看。",
+  "crystal_ball.message.out_of_range": "%s 的画面还在传送到你的客户端,请稍等……",
+  "crystal_ball.message.target_left": "%s 已经不在了,视线已回到你身上。",
+  "crystal_ball.message.not_watching": "你当前没有在观察任何人。",
+  "crystal_ball.message.stopped": "已结束观察。",
+  "crystal_ball.message.damaged": "你受到伤害,占卜球的视线中断了。",
+  "crystal_ball.message.no_permission": "你没有权限这么做(需要权限等级 %s)。",
+
+  "crystal_ball.message.viewers_none": "当前没有人在观察你。",
+  "crystal_ball.message.viewers_header": "共有 %s 人正在观察你:",
+  "crystal_ball.message.viewers_entry": " - %s",
+
+  "crystal_ball.message.relations_none": "当前没有任何观察关系。",
+  "crystal_ball.message.relations_header": "当前共有 %s 条观察关系:",
+  "crystal_ball.message.relations_entry": "%s  ->  %s",
+
+  "crystal_ball.message.permission_get": "/crystalball %s 的权限等级:%s",
+  "crystal_ball.message.permission_set": "/crystalball %s 的权限等级已设置为 %s。",
+  "crystal_ball.message.permission_reset": "/crystalball watch、stop、viewers 的权限等级已重置为 %s。",
+  "crystal_ball.command.permission.unknown": "未知的指令名:%s(可选 watch、stop、viewers)"
+}
