@@ -14,6 +14,8 @@ import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.server.ServerLifecycleHooks;
 import com.crystalball.CrystalBallMod;
+import com.crystalball.SpectateDebugLog;
+import net.minecraftforge.event.server.ServerStartedEvent;
 
 /**
  * Server side glue that keeps the watching relations consistent when players die, respawn,
@@ -40,14 +42,40 @@ public final class SpectateServerEvents {
         }
     }
 
+    /** A player joined: log it (the client logs its own player tracking as well). */
+    @SubscribeEvent
+    public static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.getPlayer() instanceof ServerPlayer player) {
+            SpectateDebugLog.SERVER.log("player join: %s uuid=%s dim=%s pos=%.2f,%.2f,%.2f",
+                    player.getGameProfile().getName(), player.getUUID(), player.level.dimension().location(),
+                    player.getX(), player.getY(), player.getZ());
+        }
+    }
+
+    /** Open the dedicated debug log once the server is up. */
+    @SubscribeEvent
+    public static void onServerStarted(ServerStartedEvent event) {
+        // A host (integrated server) must use the client's game directory: the process working
+        // directory is not necessarily the game directory when the game is started by a launcher.
+        java.io.File gameDir = net.minecraftforge.fml.loading.FMLEnvironment.dist.isClient()
+                ? net.minecraft.client.Minecraft.getInstance().gameDirectory
+                : new java.io.File(".");
+        SpectateDebugLog.SERVER.init(gameDir.toPath().resolve("logs").resolve("crystal_ball-server.log"), "server");
+        SpectateDebugLog.SERVER.log("server started: dedicated=%s gameDir=%s viewDistance=%d",
+                event.getServer().isDedicatedServer(), gameDir.getAbsolutePath(),
+                event.getServer().getPlayerList().getViewDistance());
+    }
+
     /** A player left: stop their own watching and stop everybody who was watching them. */
     @SubscribeEvent
     public static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
         if (!(event.getPlayer() instanceof ServerPlayer player)) {
             return;
         }
+        SpectateDebugLog.SERVER.log("player leave: %s uuid=%s", player.getGameProfile().getName(), player.getUUID());
         SpectateManager.onViewerLeft(player);
         SpectateManager.stopWatchersOf(player.getUUID(), "target_left");
+        SpectateRemoteView.forgetClientCaps(player.getUUID());
     }
 
     /** Taking damage ends the relation, so a knockback can never desync the remote view and the body. */
@@ -56,6 +84,9 @@ public final class SpectateServerEvents {
         if (event.getEntity() instanceof ServerPlayer player) {
             SpectateManager.onViewerHurt(player);
         }
+        // Streamed entities are client side copies without vanilla hurt handling: forward the red
+        // flash (and the new health) to whoever is watching that entity.
+        SpectateRemoteView.onLivingHurt(event.getEntityLiving());
     }
 
     /** A player died: a dead player cannot be watched and the camera of a dying viewer is reset. */
@@ -64,6 +95,7 @@ public final class SpectateServerEvents {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
+        SpectateDebugLog.SERVER.log("player death: %s", player.getGameProfile().getName());
         SpectateManager.stopWatchersOf(player.getUUID(), "target_left");
         SpectateManager.onViewerLeft(player);
     }
@@ -86,6 +118,8 @@ public final class SpectateServerEvents {
     @SubscribeEvent
     public static void onPlayerChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
         if (event.getEntity() instanceof ServerPlayer player) {
+            SpectateDebugLog.SERVER.log("player dimension: %s from=%s to=%s", player.getGameProfile().getName(),
+                    event.getFrom().location(), event.getTo().location());
             SpectateManager.onViewerLeft(player);
         }
     }
@@ -122,5 +156,7 @@ public final class SpectateServerEvents {
     @SubscribeEvent
     public static void onServerStopped(ServerStoppedEvent event) {
         SpectateManager.clear();
+        SpectateDebugLog.SERVER.log("server stopped");
+        SpectateDebugLog.SERVER.close();
     }
 }

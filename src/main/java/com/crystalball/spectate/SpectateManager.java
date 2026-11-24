@@ -1,5 +1,6 @@
 package com.crystalball.spectate;
 
+import com.crystalball.SpectateDebugLog;
 import net.minecraft.network.chat.TranslatableComponent;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -25,15 +26,15 @@ import java.util.UUID;
  * Important: the server never changes the viewer's game mode, never teleports the viewer and never
  * touches the vanilla spectator camera. Watching is a <b>client side camera effect</b>: the server
  * only remembers "viewer V is currently watching target T", validates that the target is still
- * watchable (online, alive, not a spectator and in the same dimension as the viewer) and tells the
- * viewer's client through {@link SpectateStateMessage} which player it should render from.
+ * watchable (online, alive and not a spectator), and tells the viewer's client through
+ * {@link SpectateStateMessage} which player it should render from.
  * <p>
  * Because of that the viewer keeps their own body, game mode, position, inventory and hitbox - they
  * can still be seen, attacked, pushed or killed while watching, exactly as requested.
  * <p>
- * The cost of this design is that the client can only render a target it has actually loaded: the
- * target has to be inside the viewer's loaded/visible area (roughly the server view distance).
- * Cross dimension watching is impossible without moving the player, so it is refused with a message.
+ * The world around the target is pushed to the viewer by {@link SpectateRemoteView}: chunks (also
+ * from another dimension, re-packed into an offset copy) and the entities around the target. The
+ * client therefore sees a target at any distance, in any dimension, without its body moving.
  */
 public final class SpectateManager {
 
@@ -123,7 +124,7 @@ public final class SpectateManager {
             message(viewer, "already_self");
             return;
         }
-        stop(viewer.getUUID());
+        stop(viewer.getUUID(), "alpha key");
         message(viewer, "returned");
     }
 
@@ -161,11 +162,21 @@ public final class SpectateManager {
         SpectateRemoteView.onStart(viewer, target);
         pushState(viewer);
         message(viewer, "now_watching", target.getDisplayName());
+        SpectateDebugLog.SERVER.log("session start: viewer=%s(%s) dim=%s pos=%.2f,%.2f,%.2f target=%s(%s) dim=%s pos=%.2f,%.2f,%.2f cross=%s retarget=%s",
+                viewer.getGameProfile().getName(), viewerId, viewer.level.dimension().location(),
+                viewer.getX(), viewer.getY(), viewer.getZ(),
+                target.getGameProfile().getName(), targetId, target.level.dimension().location(),
+                target.getX(), target.getY(), target.getZ(), viewer.level != target.level, existing != null);
         return true;
     }
 
     /** Ends the watching relation of the given viewer (if any). */
     public static boolean stop(UUID viewerId) {
+        return stop(viewerId, "requested");
+    }
+
+    /** Ends the watching relation of the given viewer (if any) and records why. */
+    public static boolean stop(UUID viewerId, String reason) {
         WatchSession session = SESSIONS.remove(viewerId);
         if (session == null) {
             return false;
@@ -185,6 +196,8 @@ public final class SpectateManager {
                 }
             }
         }
+        SpectateDebugLog.SERVER.log("session stop: viewer=%s(%s) target=%s(%s) reason=%s",
+                session.viewerName(), session.viewer(), session.targetName(), session.target(), reason);
         return true;
     }
 
@@ -194,7 +207,7 @@ public final class SpectateManager {
      */
     public static void onViewerHurt(ServerPlayer viewer) {
         if (SESSIONS.containsKey(viewer.getUUID())) {
-            stop(viewer.getUUID());
+            stop(viewer.getUUID(), "viewer damaged");
             message(viewer, "damaged");
         }
     }
@@ -202,7 +215,7 @@ public final class SpectateManager {
     /** Called when a viewer dies, respawns or disconnects: the relation is dropped without a message. */
     public static void onViewerLeft(ServerPlayer viewer) {
         if (SESSIONS.containsKey(viewer.getUUID())) {
-            stop(viewer.getUUID());
+            stop(viewer.getUUID(), "viewer died/respawned/changed dimension/left");
         }
     }
 
@@ -216,7 +229,7 @@ public final class SpectateManager {
         for (UUID viewerId : new ArrayList<>(viewers)) {
             ServerPlayer viewer = server == null ? null : server.getPlayerList().getPlayer(viewerId);
             String targetName = SESSIONS.containsKey(viewerId) ? SESSIONS.get(viewerId).targetName() : "";
-            stop(viewerId);
+            stop(viewerId, "target invalid: " + messageKey);
             if (viewer != null) {
                 message(viewer, messageKey, targetName);
             }
@@ -226,7 +239,7 @@ public final class SpectateManager {
     /** Ends every relation (server shutdown). */
     public static void stopAll() {
         for (UUID viewerId : new ArrayList<>(SESSIONS.keySet())) {
-            stop(viewerId);
+            stop(viewerId, "server stopping");
         }
     }
 
@@ -236,6 +249,7 @@ public final class SpectateManager {
         WATCHERS.clear();
         SpectateRemoteView.clear();
         resyncTimer = 0;
+        SpectateDebugLog.SERVER.log("all sessions cleared");
     }
 
     // ------------------------------------------------------------------
@@ -255,12 +269,12 @@ public final class SpectateManager {
         for (WatchSession session : new ArrayList<>(SESSIONS.values())) {
             ServerPlayer viewer = server.getPlayerList().getPlayer(session.viewer());
             if (viewer == null) {
-                stop(session.viewer());
+                stop(session.viewer(), "viewer offline");
                 continue;
             }
             ServerPlayer target = server.getPlayerList().getPlayer(session.target());
             if (!isWatchable(target)) {
-                stop(session.viewer());
+                stop(session.viewer(), "target not watchable");
                 message(viewer, "target_left", session.targetName());
                 continue;
             }

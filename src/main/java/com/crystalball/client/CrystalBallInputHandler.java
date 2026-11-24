@@ -27,6 +27,11 @@ import org.lwjgl.glfw.GLFW;
  * called. Cancelling it therefore stops the vanilla attack/use action completely - no arm swing, no
  * block breaking, no block placement.
  * <p>
+ * The alpha key is special: it only owns the mouse button while the camera is actually watching
+ * somebody. While the orb is merely held, left click has to remain a normal attack / air swing, so
+ * alpha-bound mouse presses are not cancelled and their click counter is drained without sending the
+ * action.
+ * <p>
  * Keyboard rebinds cannot be cancelled that early ({@code KeyInputEvent} is not cancellable), but a
  * keyboard key is not a vanilla action either, so it is enough to poll
  * {@link KeyMapping#consumeClick()} once per client tick.
@@ -49,7 +54,16 @@ public final class CrystalBallInputHandler {
         }
         InputConstants.Key key = InputConstants.Type.MOUSE.getOrCreate(event.getButton());
         int action = boundAction(key);
-        if (action < 0 || !intercepts(minecraft)) {
+        if (action < 0) {
+            return;
+        }
+        // Alpha ("return the view") only matters while the camera is actually watching somebody.
+        // While the orb is merely held, a left click must stay a normal attack / air swing, so the
+        // click is not swallowed here; the click counter is drained without sending the action below.
+        if (action == SpectateActionMessage.ACTION_ALPHA && !SpectateClientController.isCameraActive()) {
+            return;
+        }
+        if (!intercepts(minecraft)) {
             return;
         }
         // Catch the press before vanilla turns it into an attack/use action.
@@ -83,15 +97,26 @@ public final class CrystalBallInputHandler {
         }
         // In case a vanilla mouse button was already held down before the orb was taken into the hand
         // (for example continuous block breaking), keep it released while we own that button.
-        if (isMouseBound(CrystalBallKeyMappings.ALPHA, GLFW.GLFW_MOUSE_BUTTON_LEFT)) {
+        // Alpha only owns the left button while the camera is active: while the orb is merely held the
+        // left button has to keep working as a normal attack.
+        if (SpectateClientController.isCameraActive()
+                && isMouseBound(CrystalBallKeyMappings.ALPHA, GLFW.GLFW_MOUSE_BUTTON_LEFT)) {
             minecraft.options.keyAttack.setDown(false);
         }
         if (isMouseBound(CrystalBallKeyMappings.BETA, GLFW.GLFW_MOUSE_BUTTON_RIGHT)) {
             minecraft.options.keyUse.setDown(false);
         }
-        // Keyboard-bound keys arrive here (mouse-bound ones were handled and consumed in onRawMouse).
-        while (CrystalBallKeyMappings.ALPHA.consumeClick()) {
-            SpectateNetwork.sendAction(SpectateActionMessage.ACTION_ALPHA);
+        // Keyboard-bound alpha always works. A mouse-bound alpha only acts while watching; otherwise
+        // the click was a normal attack and its click counter is just discarded.
+        boolean alphaMouseBound = CrystalBallKeyMappings.ALPHA.getKey().getType() == InputConstants.Type.MOUSE;
+        if (!alphaMouseBound || SpectateClientController.isCameraActive()) {
+            while (CrystalBallKeyMappings.ALPHA.consumeClick()) {
+                SpectateNetwork.sendAction(SpectateActionMessage.ACTION_ALPHA);
+            }
+        } else {
+            while (CrystalBallKeyMappings.ALPHA.consumeClick()) {
+                // Normal attack click: do not send anything.
+            }
         }
         while (CrystalBallKeyMappings.BETA.consumeClick()) {
             SpectateNetwork.sendAction(SpectateActionMessage.ACTION_BETA);

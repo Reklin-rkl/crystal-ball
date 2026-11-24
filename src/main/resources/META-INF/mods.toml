@@ -4,7 +4,7 @@ license="CC BY-NC 4.0"
 
 [[mods]]
 modId="crystal_ball"
-version="0.30.0-alpha"
+version="0.35.0-alpha"
 displayName="Crystal Ball"
 description='''
 Watch another player through a crystal ball - without leaving your own body.
@@ -14,13 +14,13 @@ and see through their eyes while your own body, game mode, inventory and hitbox 
 they are.
 
 Features: camera-only remote viewing at any distance, cross dimension viewing (terrain, mobs, items
-and other players are streamed), vanilla F5 perspectives, configurable server side settings, and a
-/crystalball command tree with per command permission levels.
+and other players are streamed), vanilla F5 perspectives, configurable server side and client side
+settings, and a /crystalball command tree with per command permission levels.
 
-Compatibility may be poor: the mod hooks deeply into rendering, chunk streaming and dimension
-handling (it references Immersive Portals, which is itself known for low compatibility). Please
-report bugs, suggest improvements and port it to other Minecraft versions - contributions,
-pull requests and forks are welcome.
+Compatibility may be poor: the mod changes how the client renders and streams the remote world
+(chunk window, view area, entity streaming). Expect incompatibilities with camera / rendering /
+chunk mods (for example OptiFine or entity culling mods). Please report bugs, suggest improvements
+and port it to other Minecraft versions - contributions, pull requests and forks are welcome.
 '''
 authors="Reklin, DeepSeek Harness AI"
 credits="Inspired by the Crystal Ball from Terraria"

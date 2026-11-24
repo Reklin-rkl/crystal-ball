@@ -1,11 +1,11 @@
 package com.crystalball.client;
 
+import com.mojang.authlib.GameProfile;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientChunkCache;
-import net.minecraft.client.multiplayer.PlayerInfo;
-import net.minecraft.client.player.RemotePlayer;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.ViewArea;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.player.Input;
@@ -18,19 +18,25 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.decoration.ArmorStand;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.ChunkStatus;
-import com.crystalball.spectate.SpectateRemoteView;
+import net.minecraftforge.entity.PartEntity;
+import com.crystalball.CrystalBallClientConfig;
+import com.crystalball.CrystalBallMod;
+import com.crystalball.SpectateDebugLog;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
 import net.minecraftforge.client.event.EntityViewRenderEvent;
+import net.minecraftforge.client.event.RenderPlayerEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
-import com.crystalball.CrystalBallMod;
 import com.crystalball.spectate.SpectateChunkRequestMessage;
-import com.crystalball.spectate.SpectateEntityRequestMessage;
 import com.crystalball.spectate.SpectateNetwork;
 
 import javax.annotation.Nullable;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -78,6 +84,8 @@ public final class SpectateClientController {
 
     private static boolean cameraActive = false;
 
+    private static CameraType lastCameraType = CameraType.FIRST_PERSON;
+
     private static float savedYaw;
     private static float savedPitch;
     private static CameraType savedCameraType = CameraType.FIRST_PERSON;
@@ -85,17 +93,23 @@ public final class SpectateClientController {
 
     private static int logTimer = 0;
 
-    
     private static int restoreTicks = -1;
     private static int waitingTicks = 0;
-    private static boolean presentReported = false;
     private static boolean crossDimension = false;
 
-    /** Entity id of the client side camera anchor used for cross dimension watching. */
+    /** Entity id of the client side camera anchor (a clone of the watched player). */
     private static final int CAMERA_ANCHOR_ID = -420000;
 
     @Nullable
     private static LivingEntity cameraAnchor;
+
+    /**
+     * UUID of the player {@link #cameraAnchor} is a clone of. The anchor carries the skin, so when
+     * the beta key switches to another player the clone has to be rebuilt - otherwise third person
+     * keeps showing the previous player's body.
+     */
+    @Nullable
+    private static UUID anchorTargetId;
 
     /** Real (unshifted) target position and rotation as sent by the server. */
     private static double stateX;
@@ -103,7 +117,27 @@ public final class SpectateClientController {
     private static double stateZ;
     private static float anchorYaw;
     private static float anchorPitch;
-    private static int hiddenEntityId = -1;
+
+    /** Entity ids the server currently streams for this session. */
+    private static int[] streamedEntityIds = new int[0];
+
+    /** Streamed multipart entity ids whose client side parts were already snapped to the parent. */
+    private static final Set<Integer> snappedMultipartIds = new HashSet<>();
+
+    /** Ticks since the last active state message; the server sends one per tick while watching. */
+    private static int stateTicks;
+
+    /** Debug log timers (tracking diff every second, status line every five seconds). */
+    private static int trackingTicks;
+    private static int statusTicks;
+    /** Players logged as hidden by the current session (to log each transition only once). */
+    private static final Set<UUID> loggedHidden = new HashSet<>();
+    /** Client side view of the other players, used to log entity tracking add/remove/jump events. */
+    private static final Map<UUID, TrackedPlayer> trackedPlayers = new HashMap<>();
+
+    private record TrackedPlayer(String name, int id, double x, double y, double z, boolean invisible,
+            boolean anchor, boolean streamed) {
+    }
 
     private SpectateClientController() {
     }
@@ -119,6 +153,8 @@ public final class SpectateClientController {
     /** Called from {@link com.crystalball.spectate.SpectateStateMessage}. */
     public static void onState(boolean active, UUID target, String name, int entityId, double x, double y, double z,
             boolean crossDimensionFlag, float yaw, float pitch) {
+        boolean targetChanged = active && (targetId == null || !targetId.equals(target));
+        boolean stateChanged = !watching || targetChanged || crossDimension != crossDimensionFlag;
         crossDimension = crossDimensionFlag;
         stateX = x;
         stateY = y;
@@ -126,7 +162,12 @@ public final class SpectateClientController {
         anchorYaw = yaw;
         anchorPitch = pitch;
         if (active) {
+            if (stateChanged) {
+                SpectateDebugLog.CLIENT.log("state active: target=%s uuid=%s entityId=%d pos=%.2f,%.2f,%.2f cross=%s yaw=%.1f pitch=%.1f",
+                        name, target, entityId, x, y, z, crossDimensionFlag, yaw, pitch);
+            }
             watching = true;
+            stateTicks = 0;
             targetId = target;
             targetName = name == null ? "" : name;
             targetEntityId = entityId;
@@ -134,16 +175,41 @@ public final class SpectateClientController {
             lastKnownY = y;
             lastKnownZ = z;
             restoreTicks = -1;
+            if (targetChanged) {
+                // The anchor is a clone of the watched player; marked as stale, updateAnchor rebuilds
+                // it (with the new skin) and puts the camera on it again in the same tick.
+                anchorTargetId = null;
+                loggedHidden.clear();
+                SpectateDebugLog.CLIENT.log("target changed: hiding state reset");
+            }
         } else {
+            SpectateDebugLog.CLIENT.log("state inactive: was target=%s cameraActive=%s", targetName, cameraActive);
             watching = false;
             targetId = null;
             targetName = "";
             targetEntityId = -1;
             waitingTicks = 0;
-            presentReported = false;
+            streamedEntityIds = new int[0];
+            snappedMultipartIds.clear();
+            loggedHidden.clear();
             deactivate();
             restoreTicks = 0;
         }
+    }
+
+    /**
+     * Called from {@link com.crystalball.spectate.SpectateStreamedEntitiesMessage}: the entity ids the
+     * server currently streams for this session.
+     */
+    public static void onStreamedEntities(int[] ids) {
+        streamedEntityIds = ids == null ? new int[0] : ids.clone();
+        Set<Integer> current = new HashSet<>();
+        for (int id : streamedEntityIds) {
+            current.add(id);
+        }
+        snappedMultipartIds.retainAll(current);
+        SpectateDebugLog.CLIENT.log("streamed entity ids: count=%d ids=%s", streamedEntityIds.length,
+                java.util.Arrays.toString(streamedEntityIds));
     }
 
     // ------------------------------------------------------------------
@@ -160,11 +226,18 @@ public final class SpectateClientController {
             reset();
             return;
         }
+        debugTick(minecraft);
         if (!watching || targetId == null) {
             if (cameraActive) {
                 deactivate();
             }
             tickRestore(minecraft);
+            return;
+        }
+        if (++stateTicks > 100) {
+            // The server pushes an active state every tick; if they stop (connection stall, session
+            // dropped without a message) the tracking state must not block rendering forever.
+            reset();
             return;
         }
 
@@ -179,14 +252,16 @@ public final class SpectateClientController {
             lastKnownY = anchor.getY();
             lastKnownZ = anchor.getZ();
             waitingTicks = 0;
-            hideWatchedEntity(minecraft);
             if (cameraActive) {
                 maintain(minecraft, anchor);
             } else {
                 activate(minecraft, anchor);
             }
-        } else if (cameraActive) {
-            deactivate();
+        } else {
+            waitingTicks++;
+            if (cameraActive) {
+                deactivate();
+            }
         }
         if (!crossDimension && anchor == null && waitingTicks > 60 && waitingTicks % 80 == 0) {
             minecraft.player.displayClientMessage(
@@ -200,7 +275,11 @@ public final class SpectateClientController {
         // uses minecraft.player), which is why streaming alone could never show terrain far away.
         // Re-centering the view area on the camera is what actually makes remote terrain render.
         forceViewArea(minecraft, lastKnownX, lastKnownZ);
-        if (++logTimer >= 100) {
+        // Forge multipart entities (Twilight Forest's Naga, Hydra, ...) keep their parts as client
+        // side children; the owning mod only syncs their positions for vanilla tracking players, so
+        // a streamed copy would leave its body at the world origin. Snap them onto the parent.
+        syncStreamedMultipartParts(minecraft);
+        if (++logTimer >= 600) {
             logTimer = 0;
             Entity byId = targetEntityId >= 0 ? minecraft.level.getEntity(targetEntityId) : null;
             CrystalBallMod.LOGGER.info(
@@ -212,10 +291,196 @@ public final class SpectateClientController {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Diagnostics (separate per instance log file, see SpectateDebugLog)
+    // ------------------------------------------------------------------
+
+    private static void debugTick(Minecraft minecraft) {
+        if (++trackingTicks >= 20) {
+            trackingTicks = 0;
+            logPlayerTracking(minecraft);
+        }
+        if (++statusTicks >= 100) {
+            statusTicks = 0;
+            logStatus(minecraft);
+        }
+    }
+
+    /**
+     * Logs which other players the client actually has in its level. This is the key diagnostic for
+     * "player X cannot see player Y": it shows whether the entity never arrived (server tracking) or
+     * arrived and was later hidden/removed (client side).
+     */
+    private static void logPlayerTracking(Minecraft minecraft) {
+        if (minecraft.level == null) {
+            return;
+        }
+        Map<UUID, TrackedPlayer> current = new HashMap<>();
+        for (AbstractClientPlayer player : minecraft.level.players()) {
+            if (player == minecraft.player) {
+                continue;
+            }
+            boolean anchor = player == cameraAnchor;
+            boolean streamed = false;
+            for (int id : streamedEntityIds) {
+                if (id == player.getId()) {
+                    streamed = true;
+                    break;
+                }
+            }
+            double x = player.getX();
+            double y = player.getY();
+            double z = player.getZ();
+            boolean invisible = player.isInvisible();
+            TrackedPlayer previous = trackedPlayers.get(player.getUUID());
+            if (previous == null) {
+                SpectateDebugLog.CLIENT.log(
+                        "tracking +: name=%s uuid=%s id=%d pos=%.1f,%.1f,%.1f invisible=%s removed=%s anchor=%s streamed=%s",
+                        player.getGameProfile().getName(), player.getUUID(), player.getId(), x, y, z, invisible,
+                        player.isRemoved(), anchor, streamed);
+            } else {
+                double dx = x - previous.x();
+                double dy = y - previous.y();
+                double dz = z - previous.z();
+                if (dx * dx + dy * dy + dz * dz > 64.0D * 64.0D) {
+                    SpectateDebugLog.CLIENT.log(
+                            "tracking jump: name=%s uuid=%s id=%d from=%.1f,%.1f,%.1f to=%.1f,%.1f,%.1f",
+                            player.getGameProfile().getName(), player.getUUID(), player.getId(),
+                            previous.x(), previous.y(), previous.z(), x, y, z);
+                }
+                if (previous.invisible() != invisible) {
+                    SpectateDebugLog.CLIENT.log("tracking invisible: name=%s uuid=%s invisible=%s",
+                            player.getGameProfile().getName(), player.getUUID(), invisible);
+                }
+                if (previous.anchor() != anchor) {
+                    SpectateDebugLog.CLIENT.log("tracking anchor: name=%s uuid=%s anchor=%s",
+                            player.getGameProfile().getName(), player.getUUID(), anchor);
+                }
+            }
+            current.put(player.getUUID(),
+                    new TrackedPlayer(player.getGameProfile().getName(), player.getId(), x, y, z, invisible, anchor, streamed));
+        }
+        for (UUID uuid : trackedPlayers.keySet()) {
+            if (!current.containsKey(uuid)) {
+                TrackedPlayer previous = trackedPlayers.get(uuid);
+                SpectateDebugLog.CLIENT.log("tracking -: name=%s uuid=%s id=%d lastPos=%.1f,%.1f,%.1f anchor=%s streamed=%s",
+                        previous.name(), uuid, previous.id(), previous.x(), previous.y(), previous.z(),
+                        previous.anchor(), previous.streamed());
+            }
+        }
+        trackedPlayers.clear();
+        trackedPlayers.putAll(current);
+    }
+
+    private static void logStatus(Minecraft minecraft) {
+        Entity camera = minecraft.getCameraEntity();
+        String user = minecraft.getUser() == null ? "?" : minecraft.getUser().getName();
+        SpectateDebugLog.CLIENT.log(
+                "status: user=%s dim=%s pos=%.1f,%.1f,%.1f watching=%s target=%s uuid=%s cameraId=%d cameraClass=%s anchorId=%d f5=%s streamed=%d missingChunks=%d players=%d",
+                user, minecraft.level.dimension().location(),
+                minecraft.player.getX(), minecraft.player.getY(), minecraft.player.getZ(),
+                watching, targetName, targetId, camera == null ? -1 : camera.getId(),
+                camera == null ? "null" : camera.getClass().getSimpleName(),
+                cameraAnchor == null ? -1 : cameraAnchor.getId(), minecraft.options.getCameraType(),
+                streamedEntityIds.length,
+                watching ? countMissing(minecraft, lastKnownX, lastKnownZ, streamRadius(minecraft)) : -1,
+                minecraft.level.players().size());
+    }
+
     /** Disconnect: never leave a foreign camera entity behind. */
     @SubscribeEvent
     public static void onLoggingOut(ClientPlayerNetworkEvent.LoggedOutEvent event) {
         reset();
+    }
+
+    /** Announce the client half of the configuration as soon as the connection is ready. */
+    @SubscribeEvent
+    public static void onLoggedIn(ClientPlayerNetworkEvent.LoggedInEvent event) {
+        syncClientCaps();
+    }
+
+    /** Sends this client's streaming caps (entity radius / entity count) to the server. */
+    public static void syncClientCaps() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.getConnection() == null) {
+            return;
+        }
+        SpectateNetwork.sendClientCaps(CrystalBallClientConfig.entityRadius(),
+                CrystalBallClientConfig.maxStreamedEntities());
+    }
+
+    /**
+     * Hides the real entity of the watched player while its client side clone carries the camera.
+     * <p>
+     * The clone is the camera entity, so vanilla renders it - that is the body seen in third person.
+     * The real target entity is a second, network driven copy at the same position: in first person
+     * its head sits right in front of the camera (the "model in your face" bug) and in third person
+     * it duplicates the body. Cancelling its render is robust: unlike toggling the invisible flag it
+     * cannot be reverted by the next metadata packet, and when the beta key switches the target the
+     * old player is rendered normally again automatically.
+     */
+    @SubscribeEvent
+    public static void onRenderPlayer(RenderPlayerEvent.Pre event) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!cameraActive || targetId == null || minecraft.player == null) {
+            return;
+        }
+        // Never hide the local body and never hide anything when the camera has been moved away from
+        // the anchor (a stale flag must not leak into normal rendering).
+        if (event.getPlayer() == cameraAnchor || event.getPlayer() == minecraft.player
+                || minecraft.getCameraEntity() != cameraAnchor) {
+            return;
+        }
+        if (targetId.equals(event.getPlayer().getUUID())
+                || (!targetName.isEmpty() && targetName.equalsIgnoreCase(event.getPlayer().getGameProfile().getName()))) {
+            if (loggedHidden.add(event.getPlayer().getUUID())) {
+                SpectateDebugLog.CLIENT.log("hide real player: name=%s uuid=%s id=%d pos=%.1f,%.1f,%.1f",
+                        event.getPlayer().getGameProfile().getName(), event.getPlayer().getUUID(),
+                        event.getPlayer().getId(), event.getPlayer().getX(), event.getPlayer().getY(),
+                        event.getPlayer().getZ());
+            }
+            event.setCanceled(true);
+        }
+    }
+
+    /**
+     * Positions the client side parts of streamed {@link PartEntity} multipart entities.
+     * <p>
+     * Parts are not entities of their own: the parent creates them in its constructor and the owning
+     * mod syncs their positions with its own packets, but only for players that vanilla already
+     * tracks. A streamed copy is not vanilla tracked, so its parts stay at the world origin and crawl
+     * towards the body at a few blocks per tick - the entity renders as a head without a body (this
+     * is what happened to Twilight Forest's Naga). Parts of vanilla tracked entities (for example
+     * ender dragon parts) are real client entities and are left alone.
+     */
+    private static void syncStreamedMultipartParts(Minecraft minecraft) {
+        if (minecraft.level == null || streamedEntityIds.length == 0) {
+            return;
+        }
+        for (int id : streamedEntityIds) {
+            Entity entity = minecraft.level.getEntity(id);
+            if (entity == null || !entity.isMultipartEntity()) {
+                continue;
+            }
+            PartEntity<?>[] parts = entity.getParts();
+            if (parts == null) {
+                continue;
+            }
+            boolean firstSight = snappedMultipartIds.add(id);
+            for (int i = 0; i < parts.length; i++) {
+                PartEntity<?> part = parts[i];
+                if (part == null || minecraft.level.getEntity(part.getId()) != null) {
+                    continue;
+                }
+                double dx = part.getX() - entity.getX();
+                double dy = part.getY() - entity.getY();
+                double dz = part.getZ() - entity.getZ();
+                if (firstSight || dx * dx + dy * dy + dz * dz > 128.0D * 128.0D) {
+                    part.setPos(entity.getX() + 0.1D * i, entity.getY(), entity.getZ() + 0.1D * i);
+                    part.setOldPosAndRot();
+                }
+            }
+        }
     }
 
     /** While watching, pull the terrain fog in so the edge of the streamed chunk bubble is hidden. */
@@ -363,17 +628,36 @@ public final class SpectateClientController {
         if (minecraft.level == null || minecraft.player == null) {
             return null;
         }
-        if (cameraAnchor == null || cameraAnchor.level != minecraft.level) {
+        boolean rebuild = cameraAnchor == null || cameraAnchor.level != minecraft.level
+                || targetId == null || !targetId.equals(anchorTargetId);
+        if (rebuild) {
+            // Switching the watched player: drop the old clone (otherwise its body stays behind at
+            // the previous target's position) and create a new one so the skin matches the target.
+            SpectateDebugLog.CLIENT.log("anchor rebuild: target=%s uuid=%s oldAnchor=%s levelChanged=%s",
+                    targetName, targetId, cameraAnchor == null ? "none" : cameraAnchor.getId(),
+                    cameraAnchor != null && cameraAnchor.level != minecraft.level);
+            discardAnchor(minecraft);
             cameraAnchor = createAnchor(minecraft);
             if (cameraAnchor == null) {
                 return null;
             }
+            anchorTargetId = targetId;
             cameraAnchor.setId(CAMERA_ANCHOR_ID);
             cameraAnchor.setNoGravity(true);
             if (cameraAnchor instanceof AbstractClientPlayer clone) {
                 // Must be in the level or LevelRenderer never renders the camera entity, which is why
                 // third person showed no body at all. The clone is a RemotePlayer, so ticking it is safe.
                 minecraft.level.addPlayer(CAMERA_ANCHOR_ID, clone);
+                // ClientLevel adds every AbstractClientPlayer it starts tracking to its players list.
+                // Remove the anchor again: it is not a real player and must not show up in that list.
+                minecraft.level.players().remove(clone);
+            }
+            SpectateDebugLog.CLIENT.log("anchor created: id=%d entityUuid=%s name=%s",
+                    cameraAnchor.getId(), cameraAnchor.getUUID(), cameraAnchor.getName().getString());
+            if (cameraActive) {
+                // The old anchor was the camera entity a moment ago; put the camera on the new one
+                // before the next frame renders (otherwise it would use a removed entity).
+                minecraft.setCameraEntity(cameraAnchor);
             }
         }
         // The server already sends the anchor position for cross dimension sessions (target position
@@ -409,15 +693,24 @@ public final class SpectateClientController {
         cameraAnchor.setXRot(anchorPitch);
         // First person must not show the camera entity itself; the two third person views should.
         cameraAnchor.setInvisible(!(cameraAnchor instanceof AbstractClientPlayer) || minecraft.options.getCameraType().isFirstPerson());
+        if (lastCameraType != minecraft.options.getCameraType()) {
+            lastCameraType = minecraft.options.getCameraType();
+            SpectateDebugLog.CLIENT.log("camera type changed: %s (anchor invisible=%s)",
+                    lastCameraType, cameraAnchor.isInvisible());
+        }
         return cameraAnchor;
     }
 
     /**
-     * Creates the camera entity. A client side clone of the watched player is preferred: it renders
-     * the player model (skin) in third person, while vanilla hides the camera entity's own model in
-     * first person (so no face filling the view and no invisible body). The clone is deliberately NOT
-     * added to the level: a level entity would be ticked and a bare player/armor stand crashes without
-     * vanilla initialisation. Only position, rotation and eye height are read from it.
+     * Creates the camera entity: a client side clone of the watched player. It renders the player
+     * model (skin) in third person; in first person it is made invisible so it cannot block the view.
+     * The clone is added to the level by {@link #updateAnchor} (otherwise the renderer never sees it)
+     * and only position, rotation and eye height are written to it.
+     * <p>
+     * The clone gets a fresh UUID and resolves its skin from the watched player's UUID
+     * ({@link SpectateAnchorPlayer}). Using the watched player's UUID directly created two entities
+     * with the same UUID in the client level ("Duplicate entity UUID") and made the clone appear in
+     * {@code ClientLevel#players()} as a second copy of the target.
      */
     @Nullable
     private static LivingEntity createAnchor(Minecraft minecraft) {
@@ -425,49 +718,26 @@ public final class SpectateClientController {
             return null;
         }
         if (targetId != null && minecraft.getConnection() != null) {
-            PlayerInfo info = minecraft.getConnection().getPlayerInfo(targetId);
-            if (info != null) {
-                RemotePlayer clone = new RemotePlayer(minecraft.level, info.getProfile());
-                clone.setInvisible(false);
-                return clone;
-            }
+            String name = targetName.isEmpty() ? "CrystalBall" : targetName;
+            GameProfile profile = new GameProfile(UUID.randomUUID(), name);
+            SpectateAnchorPlayer clone = new SpectateAnchorPlayer(minecraft.level, profile, targetId);
+            clone.setInvisible(false);
+            SpectateDebugLog.CLIENT.log("anchor profile: name=%s cloneUuid=%s skinOwner=%s", name,
+                    profile.getId(), targetId);
+            return clone;
         }
         ArmorStand stand = new ArmorStand(minecraft.level, stateX, stateY, stateZ);
         stand.setInvisible(true);
         return stand;
     }
 
-    /** Hides the real target entity while its client side clone carries the camera (same dimension). */
-    private static void hideWatchedEntity(Minecraft minecraft) {
-        if (hiddenEntityId >= 0 || minecraft.level == null || crossDimension) {
-            return;
-        }
-        AbstractClientPlayer watched = resolveTarget(minecraft);
-        if (watched != null) {
-            watched.setInvisible(true);
-            hiddenEntityId = watched.getId();
-        }
-    }
-
-    private static void restoreWatchedEntity(Minecraft minecraft) {
-        if (hiddenEntityId < 0) {
-            return;
-        }
-        if (minecraft.level != null) {
-            Entity watched = minecraft.level.getEntity(hiddenEntityId);
-            if (watched != null) {
-                watched.setInvisible(false);
-            }
-        }
-        hiddenEntityId = -1;
-    }
-    private static void removeAnchor(Minecraft minecraft) {
-        restoreWatchedEntity(minecraft);
-        if (cameraAnchor instanceof AbstractClientPlayer
-                && cameraAnchor.level instanceof net.minecraft.client.multiplayer.ClientLevel clientLevel) {
+    /** Removes the client side camera anchor from the level (if there is one). */
+    private static void discardAnchor(Minecraft minecraft) {
+        if (cameraAnchor instanceof AbstractClientPlayer && cameraAnchor.level instanceof ClientLevel clientLevel) {
             clientLevel.removeEntity(cameraAnchor.getId(), Entity.RemovalReason.DISCARDED);
         }
         cameraAnchor = null;
+        anchorTargetId = null;
     }
 
     private static void activate(Minecraft minecraft, Entity target) {
@@ -487,6 +757,8 @@ public final class SpectateClientController {
         minecraft.player.setNoGravity(true);
         cameraActive = true;
         zeroInput(minecraft);
+        SpectateDebugLog.CLIENT.log("camera activate: entityId=%d class=%s target=%s f5=%s",
+                target.getId(), target.getClass().getSimpleName(), targetName, minecraft.options.getCameraType());
     }
 
     private static void maintain(Minecraft minecraft, Entity target) {
@@ -506,30 +778,49 @@ public final class SpectateClientController {
     }
 
     private static void deactivate() {
+        boolean wasActive = cameraActive;
         cameraActive = false;
+        SpectateDebugLog.CLIENT.log("camera deactivate: wasActive=%s target=%s", wasActive, targetName);
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.player != null) {
-            minecraft.setCameraEntity(minecraft.player);
-            minecraft.player.input = new KeyboardInput(minecraft.options);
-            minecraft.player.setNoGravity(savedNoGravity);
+            if (wasActive) {
+                minecraft.setCameraEntity(minecraft.player);
+                minecraft.player.input = new KeyboardInput(minecraft.options);
+                minecraft.player.setNoGravity(savedNoGravity);
+            }
             // Hand the chunk window and the render area back before anything else, so the player's own
             // surroundings are readable again immediately (missing chunks are pushed by the server).
+            // This is needed even when the camera never activated: the chunk window follows the target
+            // as soon as a state arrives.
             forceChunkCenter(minecraft, minecraft.player.getX(), minecraft.player.getZ());
             forceViewArea(minecraft, minecraft.player.getX(), minecraft.player.getZ());
         }
-        minecraft.gameRenderer.setRenderHand(true);
-        minecraft.smartCull = true;
-        minecraft.options.setCameraType(savedCameraType);
-        removeAnchor(minecraft);
+        if (wasActive) {
+            // Only touch these when the camera really took over; otherwise the player's own F5 choice
+            // would be reset by an inactive state message.
+            minecraft.gameRenderer.setRenderHand(true);
+            minecraft.smartCull = true;
+            minecraft.options.setCameraType(savedCameraType);
+        }
+        discardAnchor(minecraft);
     }
 
     private static void reset() {
+        boolean hadSession = watching || cameraActive || targetId != null;
+        if (hadSession) {
+            SpectateDebugLog.CLIENT.log("reset: watching=%s cameraActive=%s target=%s", watching, cameraActive, targetName);
+        }
         watching = false;
         targetId = null;
         targetName = "";
         targetEntityId = -1;
         restoreTicks = -1;
         waitingTicks = 0;
+        stateTicks = 0;
+        streamedEntityIds = new int[0];
+        snappedMultipartIds.clear();
+        loggedHidden.clear();
+        trackedPlayers.clear();
         if (cameraActive) {
             cameraActive = false;
             Minecraft minecraft = Minecraft.getInstance();
@@ -544,7 +835,7 @@ public final class SpectateClientController {
             }
             minecraft.options.setCameraType(savedCameraType);
         }
-        removeAnchor(Minecraft.getInstance());
+        discardAnchor(Minecraft.getInstance());
     }
 
     private static void zeroInput(Minecraft minecraft) {
@@ -552,42 +843,5 @@ public final class SpectateClientController {
         // Keep sneaking so the player does not fall off the edge simply because they looked away.
         empty.shiftKeyDown = minecraft.player.input != null && minecraft.player.input.shiftKeyDown;
         minecraft.player.input = empty;
-    }
-
-    @Nullable
-    private static AbstractClientPlayer resolveTarget(Minecraft minecraft) {
-        if (minecraft.level == null || targetId == null) {
-            return null;
-        }
-        if (targetEntityId >= 0) {
-            Entity entity = minecraft.level.getEntity(targetEntityId);
-            if (entity instanceof AbstractClientPlayer player && targetId.equals(player.getUUID())) {
-                return player;
-            }
-        }
-        for (AbstractClientPlayer player : minecraft.level.players()) {
-            if (targetId.equals(player.getUUID())) {
-                return player;
-            }
-        }
-        // Offline mode / mixed premium-offline servers can hand out different UUIDs to the two sides
-        // (the server session knows the offline UUID while the client profile may carry another one),
-        // which made resolveTarget fail even though the player entity was right there. Fall back to
-        // the name in that case - the name is always identical and the entity id already matched.
-        if (!targetName.isEmpty()) {
-            if (targetEntityId >= 0) {
-                Entity entity = minecraft.level.getEntity(targetEntityId);
-                if (entity instanceof AbstractClientPlayer player
-                        && targetName.equalsIgnoreCase(player.getGameProfile().getName())) {
-                    return player;
-                }
-            }
-            for (AbstractClientPlayer player : minecraft.level.players()) {
-                if (targetName.equalsIgnoreCase(player.getGameProfile().getName())) {
-                    return player;
-                }
-            }
-        }
-        return null;
     }
 }

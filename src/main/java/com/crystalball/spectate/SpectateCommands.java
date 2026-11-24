@@ -103,7 +103,7 @@ public final class SpectateCommands {
             source.sendSuccess(new TranslatableComponent("crystal_ball.message.not_watching"), false);
             return 0;
         }
-        SpectateManager.stop(viewer.getUUID());
+        SpectateManager.stop(viewer.getUUID(), "command");
         source.sendSuccess(new TranslatableComponent("crystal_ball.message.stopped"), false);
         return 1;
     }

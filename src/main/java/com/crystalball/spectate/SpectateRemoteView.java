@@ -4,11 +4,15 @@ import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import com.mojang.datafixers.util.Pair;
 import io.netty.buffer.Unpooled;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Registry;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.game.ClientboundAddEntityPacket;
+import net.minecraft.network.protocol.game.ClientboundAddMobPacket;
 import net.minecraft.network.protocol.game.ClientboundAddPlayerPacket;
+import net.minecraft.network.protocol.game.ClientboundEntityEventPacket;
 import net.minecraft.network.protocol.game.ClientboundForgetLevelChunkPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundMoveEntityPacket;
@@ -16,6 +20,7 @@ import net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundRotateHeadPacket;
 import net.minecraft.network.protocol.game.ClientboundSetChunkCacheCenterPacket;
 import net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket;
+import net.minecraft.network.protocol.game.ClientboundSetEquipmentPacket;
 import net.minecraft.network.protocol.game.ClientboundTeleportEntityPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -24,17 +29,23 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.Vec3;
 import com.crystalball.CrystalBallMod;
+import com.crystalball.SpectateDebugLog;
 
 import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -76,12 +87,37 @@ public final class SpectateRemoteView {
                 : com.crystalball.CrystalBallConfig.CHUNKS_PER_TICK.get();
     }
 
-    /** Non-player entities are streamed for this radius around the watched player. */
-    private static double entityRadius() {
-        return com.crystalball.CrystalBallConfig.ENTITY_RADIUS.get();
+    /**
+     * Non-player entities are streamed for this radius around the watched player.
+     * <p>
+     * The server config and the client config both define it; the smaller one wins and {@code -1}
+     * means "no limit" (so the other side decides). A client that has not announced its limits yet
+     * is treated as unlimited, which keeps the server config authoritative.
+     */
+    private static double entityRadius(ServerPlayer viewer) {
+        ClientCaps caps = clientCaps(viewer);
+        return effectiveCap(com.crystalball.CrystalBallConfig.ENTITY_RADIUS.get(), caps.entityRadius());
     }
-    private static int maxStreamedEntities() {
-        return com.crystalball.CrystalBallConfig.MAX_ENTITIES.get();
+
+    private static int maxStreamedEntities(ServerPlayer viewer) {
+        ClientCaps caps = clientCaps(viewer);
+        return effectiveCap(com.crystalball.CrystalBallConfig.MAX_ENTITIES.get(), caps.maxStreamedEntities());
+    }
+
+    /** {@code -1} = unlimited on both sides. */
+    private static int effectiveCap(int serverValue, int clientValue) {
+        if (serverValue < 0) {
+            return clientValue;
+        }
+        if (clientValue < 0) {
+            return serverValue;
+        }
+        return Math.min(serverValue, clientValue);
+    }
+
+    private static ClientCaps clientCaps(ServerPlayer viewer) {
+        ClientCaps caps = CLIENT_CAPS.get(viewer.getUUID());
+        return caps == null ? ClientCaps.UNLIMITED : caps;
     }
 
     /** Chunk packets sent per tick while restoring the area around the viewer's own body. */
@@ -91,6 +127,9 @@ public final class SpectateRemoteView {
     private static final int RESTORE_RADIUS = 5;
 
     private static final int LOG_INTERVAL = 100;
+
+    /** All slots that {@code ClientboundSetEquipmentPacket} can carry. */
+    private static final EquipmentSlot[] EQUIPMENT_SLOTS = EquipmentSlot.values();
 
     /**
      * Cross dimension watching moves the streamed world far away from the viewer's own loaded area.
@@ -113,13 +152,29 @@ public final class SpectateRemoteView {
     private static final Map<UUID, ViewState> STATES = new HashMap<>();
     private static final Map<UUID, RestoreState> RESTORES = new HashMap<>();
 
+    /**
+     * Streaming limits announced by the client config ({@link com.crystalball.CrystalBallClientConfig}).
+     * {@code -1} means "no client limit" so the server config decides.
+     */
+    private static final Map<UUID, ClientCaps> CLIENT_CAPS = new HashMap<>();
+
+    private record ClientCaps(int entityRadius, int maxStreamedEntities) {
+        static final ClientCaps UNLIMITED = new ClientCaps(-1, -1);
+    }
+
     /** Cache of chunks that had to be re-packed into the viewer's dimension (cross dimension watch). */
     private static final Map<ChunkCacheKey, CachedPacket> PACKET_CACHE = new HashMap<>();
     private static final int PACKET_CACHE_TICKS = 40;
     private static final int PACKET_CACHE_MAX = 2048;
     private static long tickCounter;
 
-    private record ChunkCacheKey(ResourceKey<Level> source, ResourceKey<Level> destination, long chunkPos, int sectionOffsetY) {
+    /**
+     * Cache key of a re-packed chunk. {@code sourcePos} is kept as well so a block change can drop
+     * every cached copy of the chunk (all destination offsets / vertical windows) without knowing
+     * which viewer requested it.
+     */
+    private record ChunkCacheKey(ResourceKey<Level> source, ResourceKey<Level> destination, long sourcePos,
+            long chunkPos, int sectionOffsetY) {
     }
 
     private static final class CachedPacket {
@@ -148,7 +203,7 @@ public final class SpectateRemoteView {
         int lastCandidateCount;
         /** Entities currently streamed to the viewer: entity id -> last sent (offset) position. */
         final Map<Integer, SentEntity> entities = new HashMap<>();
-        final Map<Long, Integer> resendCooldown = new HashMap<>();
+        final Map<Long, Long> resendCooldown = new HashMap<>();
         @Nullable
         ChunkPos center;
         final LongOpenHashSet sent = new LongOpenHashSet();
@@ -172,6 +227,10 @@ public final class SpectateRemoteView {
         int syncTicks;
         int sentTotal;
         int unloadedTotal;
+        /** Last entity id set announced to the client (sorted) so it is only resent when it changes. */
+        int[] lastSentStreamedIds = new int[0];
+        /** Turns between two periodic debug log lines. */
+        int debugTicks;
     }
 
     private static final class RestoreState {
@@ -205,7 +264,12 @@ public final class SpectateRemoteView {
     // ------------------------------------------------------------------
 
     public static void onStart(ServerPlayer viewer, ServerPlayer target) {
-        clearEntity(viewer, STATES.get(viewer.getUUID()));
+        ViewState previous = STATES.get(viewer.getUUID());
+        clearEntity(viewer, previous);
+        // Retargeting keeps the same viewer, but the entities around the previous target are not
+        // around the new one: drop them explicitly, otherwise their client side copies stay in the
+        // world forever (ghost mobs / ghost players after switching with the beta key).
+        clearStreamedEntities(viewer, previous);
         ViewState state = new ViewState();
         state.dimension = target.level.dimension();
         state.center = target.chunkPosition();
@@ -220,6 +284,42 @@ public final class SpectateRemoteView {
         state.burstTicks = BURST_TICKS;
         STATES.put(viewer.getUUID(), state);
         sendCenter(viewer, offsetCenter(state));
+        // The previous session may have streamed entities around another target; start with an empty
+        // set so the client never applies streamed-only fixes to stale ids.
+        SpectateNetwork.sendStreamedEntities(viewer, new int[0]);
+        SpectateDebugLog.SERVER.log("stream start: viewer=%s target=%s dim=%s center=(%d,%d) offset=(%d,%d) sectionOffset=%d yShift=%.2f cross=%s",
+                viewer.getGameProfile().getName(), target.getGameProfile().getName(), state.dimension.location(),
+                state.center.x, state.center.z, state.offsetXChunks, state.offsetZChunks, state.sectionOffsetY,
+                state.yShift, viewer.level != target.level);
+    }
+
+    // ------------------------------------------------------------------
+    // Client announced limits (client half of the configuration)
+    // ------------------------------------------------------------------
+
+    /** Stores the streaming limits announced by a client. Values are clamped, never trusted. */
+    public static void onClientCaps(ServerPlayer viewer, int entityRadius, int maxStreamedEntities) {
+        if (viewer == null) {
+            return;
+        }
+        int radius = sanitizeCap(entityRadius);
+        int max = sanitizeCap(maxStreamedEntities);
+        CLIENT_CAPS.put(viewer.getUUID(), new ClientCaps(radius, max));
+        SpectateDebugLog.SERVER.log("client caps: player=%s entityRadius=%d maxStreamedEntities=%d",
+                viewer.getGameProfile().getName(), radius, max);
+    }
+
+    /** Drops the announced limits of a viewer that left (they are sent again on the next join). */
+    public static void forgetClientCaps(UUID viewer) {
+        CLIENT_CAPS.remove(viewer);
+    }
+
+    private static int sanitizeCap(int value) {
+        if (value < 0) {
+            // Every negative value means "no client side limit"; only the server config applies.
+            return -1;
+        }
+        return Math.min(value, 4096);
     }
 
     private static void applyOffsets(ServerPlayer viewer, ServerPlayer target, ViewState state, boolean crossDimension) {
@@ -342,6 +442,10 @@ public final class SpectateRemoteView {
             sendCenter(viewer, offsetCenter(state));
             state.sent.clear();
             state.burstTicks = BURST_TICKS;
+            SpectateDebugLog.SERVER.log("stream remap: viewer=%s target=%s dim=%s center=%s offset=(%d,%d) sectionOffset=%d yShift=%.2f",
+                    viewer.getGameProfile().getName(), target.getGameProfile().getName(),
+                    state.dimension.location(), offsetCenter(state), state.offsetXChunks, state.offsetZChunks,
+                    state.sectionOffsetY, state.yShift);
         }
 
         int sentNow = pushChunks(viewer, targetLevel, state);
@@ -360,10 +464,22 @@ public final class SpectateRemoteView {
                     target.getGameProfile().getName(), targetChunk.x, targetChunk.z, state.sent.size(), sentNow,
                     state.unloadedTotal, state.injected, state.lastCandidateCount, target.getX(), target.getY(), target.getZ(), anchorX(viewer, target), anchorY(viewer, target), anchorZ(viewer, target), state.yShift, describeEntities(state));
         }
+        if (++state.debugTicks >= 20) {
+            state.debugTicks = 0;
+            SpectateDebugLog.SERVER.log(
+                    "stream tick: viewer=%s target=%s dim=%s pos=%.1f,%.1f,%.1f center=%s offset=(%d,%d) sectionOffset=%d yShift=%.2f sent=%d candidates=%d entities=[%s]",
+                    viewer.getGameProfile().getName(), target.getGameProfile().getName(),
+                    targetLevel.dimension().location(), target.getX(), target.getY(), target.getZ(),
+                    offsetCenter(state), state.offsetXChunks, state.offsetZChunks, state.sectionOffsetY, state.yShift,
+                    state.sent.size(), state.lastCandidateCount, describeEntityNames(targetLevel, state));
+        }
     }
 
     public static void onStop(ServerPlayer viewer, @Nullable ServerPlayer target) {
         ViewState state = STATES.remove(viewer.getUUID());
+        SpectateDebugLog.SERVER.log("stream stop: viewer=%s target=%s streamed=%d sentChunks=%d",
+                viewer.getGameProfile().getName(), target == null ? "?" : target.getGameProfile().getName(),
+                state == null ? -1 : state.entities.size(), state == null ? -1 : state.sent.size());
         clearEntity(viewer, state);
         clearStreamedEntities(viewer, state);
         // If we injected the entity while the vanilla tracker also considers it tracked, re-add it so
@@ -421,6 +537,8 @@ public final class SpectateRemoteView {
     public static void clear() {
         STATES.clear();
         RESTORES.clear();
+        CLIENT_CAPS.clear();
+        PACKET_CACHE.clear();
     }
 
     // ------------------------------------------------------------------
@@ -485,6 +603,10 @@ public final class SpectateRemoteView {
         for (int i = 0; i < expired.size(); i++) {
             state.sent.remove(expired.getLong(i));
         }
+        // The resend cooldown only has to survive a few seconds; keep it from growing while a viewer
+        // watches a busy area for a long time.
+        long now = tickCounter;
+        state.resendCooldown.entrySet().removeIf(entry -> now - entry.getValue() > 600L);
     }
 
     /**
@@ -545,7 +667,8 @@ public final class SpectateRemoteView {
             return new ClientboundLevelChunkWithLightPacket(chunk, source.getLightEngine(), null, null, true);
         }
         ChunkPos offsetPos = new ChunkPos(chunk.getPos().x + offsetX, chunk.getPos().z + offsetZ);
-        ChunkCacheKey key = new ChunkCacheKey(source.dimension(), destination.dimension(), offsetPos.toLong(), sectionOffsetY);
+        ChunkCacheKey key = new ChunkCacheKey(source.dimension(), destination.dimension(), chunk.getPos().toLong(),
+                offsetPos.toLong(), sectionOffsetY);
         CachedPacket cached = PACKET_CACHE.get(key);
         if (cached != null && tickCounter - cached.tick <= PACKET_CACHE_TICKS) {
             return cached.packet;
@@ -713,6 +836,23 @@ public final class SpectateRemoteView {
             return;
         }
         ChunkPos changed = new ChunkPos(pos);
+        long sourcePos = changed.toLong();
+        boolean watched = false;
+        for (ViewState state : STATES.values()) {
+            if (state.center == null || state.dimension == null || !state.dimension.equals(level.dimension())) {
+                continue;
+            }
+            watched = true;
+            break;
+        }
+        if (!watched) {
+            return;
+        }
+        // The cross dimension copies of this chunk are cached for a few ticks; a stale copy would
+        // swallow the block change (the packet is resent from the cache and marked as sent).
+        PACKET_CACHE.keySet().removeIf(key -> key.source().equals(level.dimension()) && key.sourcePos() == sourcePos);
+        long now = tickCounter;
+        int cooldown = com.crystalball.CrystalBallConfig.BLOCK_RESEND_COOLDOWN.get();
         for (ViewState state : STATES.values()) {
             if (state.center == null || state.dimension == null || !state.dimension.equals(level.dimension())) {
                 continue;
@@ -722,11 +862,14 @@ public final class SpectateRemoteView {
                 continue;
             }
             long key = ChunkPos.asLong(changed.x + state.offsetXChunks, changed.z + state.offsetZChunks);
-            Integer last = state.resendCooldown.put(key, (int) tickCounter);
-            int cooldown = com.crystalball.CrystalBallConfig.BLOCK_RESEND_COOLDOWN.get();
-            if (last != null && (int) tickCounter - last < cooldown) {
+            Long last = state.resendCooldown.get(key);
+            // Only refresh the timestamp when the chunk is really pushed again. Updating it before
+            // this check meant a continuously changing chunk (flowing water, redstone, ...) was
+            // never resent at all.
+            if (last != null && now - last < cooldown) {
                 continue;
             }
+            state.resendCooldown.put(key, now);
             state.sent.remove(key);
         }
     }
@@ -750,20 +893,16 @@ public final class SpectateRemoteView {
         boolean sameDimension = viewer.level == level;
         if (sameDimension && !com.crystalball.CrystalBallConfig.ENTITY_SAME_DIMENSION.get()) {
             clearStreamedEntities(viewer, state);
+            notifyStreamedEntities(viewer, state);
             return;
         }
-        int viewDistance = 10;
-        MinecraftServer server = viewer.getServer();
-        if (server != null) {
-            viewDistance = server.getPlayerList().getViewDistance();
-        }
-        double vanillaRange = Math.max(8.0D, Math.min(EntityType.PLAYER.clientTrackingRange() * 16.0D,
-                Math.max(1, viewDistance - 1) * 16.0D));
-        List<Entity> around = level.getEntities(target, target.getBoundingBox().inflate(entityRadius()),
-                entity -> isStreamable(viewer, target, entity, sameDimension ? vanillaRange : -1.0D));
-        if (around.size() > maxStreamedEntities()) {
-            around.sort(java.util.Comparator.comparingDouble(entity -> entity.distanceToSqr(target)));
-            around = around.subList(0, maxStreamedEntities());
+        double vanillaRange = vanillaTrackingRange(viewer);
+        double radius = entityRadius(viewer);
+        int maxEntities = maxStreamedEntities(viewer);
+        List<Entity> around = collectEntities(viewer, target, level, radius, sameDimension ? vanillaRange : -1.0D);
+        if (maxEntities >= 0 && around.size() > maxEntities) {
+            around.sort(Comparator.comparingDouble(entity -> entity.distanceToSqr(target)));
+            around = new ArrayList<>(around.subList(0, maxEntities));
         }
         java.util.HashSet<Integer> seen = new java.util.HashSet<>();
         state.lastCandidateCount = around.size();
@@ -781,6 +920,9 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
             if (sent == null) {
                 addStreamedEntity(viewer, entity, ex, ey, ez);
                 state.entities.put(id, new SentEntity(ex, ey, ez, entity.getYRot(), entity.getXRot()));
+                SpectateDebugLog.SERVER.log("stream entity +: viewer=%s id=%d type=%s name=%s pos=%.1f,%.1f,%.1f",
+                        viewer.getGameProfile().getName(), id, Registry.ENTITY_TYPE.getKey(entity.getType()),
+                        entity.getName().getString(), ex, ey, ez);
                 continue;
             }
             double dx = ex - sent.x;
@@ -799,6 +941,11 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
             } else if (sent.age % 40 == 0) {
                 // Periodic metadata refresh (item changed, pose, on fire, ...).
                 viewer.connection.send(new ClientboundSetEntityDataPacket(id, entity.getEntityData(), true));
+                if (entity instanceof LivingEntity living) {
+                    // Equipment has no change packet of its own here: resend it with the metadata so
+                    // armour / held items (skeleton bow, ...) cannot get out of sync.
+                    sendEquipment(viewer, living);
+                }
             }
             sent.x = ex;
             sent.y = ey;
@@ -808,13 +955,67 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
             sent.age++;
         }
         Iterator<Map.Entry<Integer, SentEntity>> iterator = state.entities.entrySet().iterator();
+        double vanillaRangeSq = vanillaRange * vanillaRange;
         while (iterator.hasNext()) {
             Map.Entry<Integer, SentEntity> entry = iterator.next();
-            if (!seen.contains(entry.getKey())) {
+            if (seen.contains(entry.getKey())) {
+                continue;
+            }
+            Entity streamed = level.getEntity(entry.getKey());
+            // Only drop entities that vanilla does not track for the viewer. Removing a vanilla tracked
+            // entity would delete the real one from the client (it would flicker away until the
+            // vanilla tracker notices), which happened when a streamed entity walked into range.
+            boolean vanillaHandlesIt = sameDimension && streamed != null
+                    && viewer.distanceToSqr(streamed) <= vanillaRangeSq;
+            if (!vanillaHandlesIt) {
                 viewer.connection.send(new ClientboundRemoveEntitiesPacket(entry.getKey()));
-                iterator.remove();
+            }
+            SpectateDebugLog.SERVER.log("stream entity -: viewer=%s id=%d vanillaHandles=%s",
+                    viewer.getGameProfile().getName(), entry.getKey(), vanillaHandlesIt);
+            iterator.remove();
+        }
+        notifyStreamedEntities(viewer, state);
+    }
+
+    /**
+     * Tells the client which entity ids are currently streamed, so it can apply fixes that must only
+     * touch streamed copies (multipart part positions, for example).
+     */
+    private static void notifyStreamedEntities(ServerPlayer viewer, ViewState state) {
+        if (viewer.connection == null) {
+            return;
+        }
+        int[] ids = new int[state.entities.size()];
+        int index = 0;
+        for (Integer id : state.entities.keySet()) {
+            ids[index++] = id;
+        }
+        Arrays.sort(ids);
+        if (Arrays.equals(ids, state.lastSentStreamedIds)) {
+            return;
+        }
+        state.lastSentStreamedIds = ids;
+        SpectateNetwork.sendStreamedEntities(viewer, ids);
+    }
+
+    /**
+     * Collects the entities to stream. With a negative radius ("no limit") every entity of the level
+     * is considered: building an AABB for "unlimited" would walk every chunk section of the
+     * dimension, which is far more expensive than iterating the loaded entity list.
+     */
+    private static List<Entity> collectEntities(ServerPlayer viewer, ServerPlayer target, ServerLevel level, double radius,
+            double vanillaRange) {
+        if (radius >= 0.0D) {
+            return level.getEntities(target, target.getBoundingBox().inflate(radius),
+                    entity -> isStreamable(viewer, target, entity, vanillaRange));
+        }
+        List<Entity> found = new ArrayList<>();
+        for (Entity entity : level.getAllEntities()) {
+            if (isStreamable(viewer, target, entity, vanillaRange)) {
+                found.add(entity);
             }
         }
+        return found;
     }
 
     private static boolean isStreamable(ServerPlayer viewer, ServerPlayer target, Entity entity, double vanillaRange) {
@@ -822,15 +1023,12 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
                 || entity.getUUID().equals(target.getUUID()) || entity.getUUID().equals(viewer.getUUID())) {
             return false;
         }
-        if (entity instanceof net.minecraft.world.entity.boss.EnderDragonPart) {
-            // Dragon hit boxes are separate entities but share the dragon type; streaming them created
-            // a swarm of ghost dragons on the viewer.
+        if (entity instanceof net.minecraftforge.entity.PartEntity<?>
+                || entity instanceof net.minecraft.world.entity.boss.EnderDragonPart) {
+            // Multipart hit boxes are not standalone entities on the client: the parent entity creates
+            // them in its constructor and the owning mod syncs their positions separately. Streaming
+            // them as entities creates bogus copies (a swarm of ghost dragons / naga heads).
             return false;
-        }
-        if (entity.getType() == EntityType.PLAYER) {
-            // Players are streamed like any other entity: in cross dimension sessions vanilla sends
-            // nothing, and in the same dimension the range check below already skips everyone that
-            // vanilla tracks itself, so only far away players get a copy here.
         }
         if (vanillaRange > 0.0D && entity.getType() == EntityType.ENDER_DRAGON) {
             // Vanilla tracks the ender dragon for every player in the End on its own.
@@ -847,10 +1045,12 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
     /**
      * Adds one streamed entity at an absolute (already offset) position.
      * <p>
-     * Players cannot be created from {@code ClientboundAddEntityPacket} (the player type has no client
-     * factory); vanilla sends them with {@code ClientboundAddPlayerPacket}, which only has an
-     * Entity-based constructor and therefore no way to offset the position. The packet's buffer
-     * constructor is used directly for that case, so other players can be shown in the offset world.
+     * The spawn packet has to match the entity type, because mods override the matching
+     * {@code recreateFromPacket} method: mobs use {@code ClientboundAddMobPacket} (which also carries
+     * the head yaw and runs, for example, Twilight Forest's multipart id assignment), players use
+     * {@code ClientboundAddPlayerPacket} (the player type has no client factory) and everything else
+     * uses {@code ClientboundAddEntityPacket}. Both constructors only accept an entity, so the packet
+     * is built from its buffer to allow the offset position.
      */
     private static void addStreamedEntity(ServerPlayer viewer, Entity entity, double ex, double ey, double ez) {
         if (entity instanceof Player) {
@@ -863,13 +1063,77 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
             buffer.writeByte(packDegrees(entity.getYRot()));
             buffer.writeByte(packDegrees(entity.getXRot()));
             viewer.connection.send(new ClientboundAddPlayerPacket(buffer));
+        } else if (entity instanceof LivingEntity living) {
+            viewer.connection.send(createAddMobPacket(living, ex, ey, ez));
         } else {
+            // The constructor order is (xRot, yRot), not (yRot, xRot).
             viewer.connection.send(new ClientboundAddEntityPacket(entity.getId(), entity.getUUID(), ex, ey, ez,
-                    entity.getYRot(), entity.getXRot(), entity.getType(), 0, Vec3.ZERO));
+                    entity.getXRot(), entity.getYRot(), entity.getType(), 0, Vec3.ZERO));
         }
         viewer.connection.send(new ClientboundSetEntityDataPacket(entity.getId(), entity.getEntityData(), true));
         if (entity instanceof LivingEntity living) {
             viewer.connection.send(new ClientboundRotateHeadPacket(entity, packDegrees(living.getYHeadRot())));
+            // Without the equipment packet a streamed skeleton has no bow and a zombie no armour,
+            // because the spawn packet only creates the bare entity.
+            sendEquipment(viewer, living);
+        }
+    }
+
+    /** Builds a {@code ClientboundAddMobPacket} at an offset position (the entity constructor cannot offset). */
+    private static ClientboundAddMobPacket createAddMobPacket(LivingEntity living, double x, double y, double z) {
+        FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.buffer());
+        buffer.writeVarInt(living.getId());
+        buffer.writeUUID(living.getUUID());
+        buffer.writeVarInt(Registry.ENTITY_TYPE.getId(living.getType()));
+        buffer.writeDouble(x);
+        buffer.writeDouble(y);
+        buffer.writeDouble(z);
+        buffer.writeByte(packDegrees(living.getYRot()));
+        buffer.writeByte(packDegrees(living.getXRot()));
+        buffer.writeByte(packDegrees(living.getYHeadRot()));
+        Vec3 motion = living.getDeltaMovement();
+        buffer.writeShort((int) (Mth.clamp(motion.x, -3.9D, 3.9D) * 8000.0D));
+        buffer.writeShort((int) (Mth.clamp(motion.y, -3.9D, 3.9D) * 8000.0D));
+        buffer.writeShort((int) (Mth.clamp(motion.z, -3.9D, 3.9D) * 8000.0D));
+        return new ClientboundAddMobPacket(buffer);
+    }
+
+    /** Sends every equipment slot (empty stacks clear a slot), like vanilla does for tracked mobs. */
+    private static void sendEquipment(ServerPlayer viewer, LivingEntity living) {
+        if (viewer.connection == null) {
+            return;
+        }
+        List<Pair<EquipmentSlot, ItemStack>> slots = new ArrayList<>(EQUIPMENT_SLOTS.length);
+        for (EquipmentSlot slot : EQUIPMENT_SLOTS) {
+            slots.add(Pair.of(slot, living.getItemBySlot(slot)));
+        }
+        viewer.connection.send(new ClientboundSetEquipmentPacket(living.getId(), slots));
+    }
+
+    /**
+     * Forwards the red hurt flash to viewers that currently stream the hurt entity. The health value
+     * itself travels with the periodic metadata refresh; the entity event is what starts the 10 tick
+     * red overlay on the client.
+     */
+    public static void onLivingHurt(LivingEntity entity) {
+        if (entity == null || STATES.isEmpty() || entity.level.isClientSide) {
+            return;
+        }
+        MinecraftServer server = entity.getServer();
+        if (server == null) {
+            return;
+        }
+        int entityId = entity.getId();
+        for (Map.Entry<UUID, ViewState> entry : STATES.entrySet()) {
+            if (!entry.getValue().entities.containsKey(entityId)) {
+                continue;
+            }
+            ServerPlayer viewer = server.getPlayerList().getPlayer(entry.getKey());
+            if (viewer == null || viewer.connection == null) {
+                continue;
+            }
+            viewer.connection.send(new ClientboundEntityEventPacket(entity, (byte) 2));
+            viewer.connection.send(new ClientboundSetEntityDataPacket(entityId, entity.getEntityData(), true));
         }
     }
     /** Short description of the streamed entities for the periodic log (diagnostics only). */
@@ -893,17 +1157,62 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
         builder.append(']');
         return builder.toString();
     }
-    private static void clearStreamedEntities(ServerPlayer viewer, ViewState state) {
+
+    /** Human readable list of the streamed entities (id, type and player name) for the debug log. */
+    private static String describeEntityNames(ServerLevel level, ViewState state) {
+        if (state.entities.isEmpty()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        int count = 0;
+        for (Integer id : state.entities.keySet()) {
+            if (count++ > 0) {
+                builder.append(',');
+            }
+            Entity entity = level.getEntity(id);
+            if (entity == null) {
+                builder.append(id).append("=gone");
+            } else {
+                builder.append(id).append('=').append(Registry.ENTITY_TYPE.getKey(entity.getType()));
+                if (entity instanceof Player player) {
+                    builder.append('(').append(player.getGameProfile().getName()).append(')');
+                }
+            }
+            if (count >= 10) {
+                builder.append(",...");
+                break;
+            }
+        }
+        return builder.toString();
+    }
+    private static void clearStreamedEntities(ServerPlayer viewer, @Nullable ViewState state) {
         if (state == null || state.entities.isEmpty()) {
             return;
         }
         if (viewer.connection != null) {
-            int[] ids = new int[state.entities.size()];
-            int index = 0;
+            // Same rule as in streamEntities: never delete an entity from the client when vanilla
+            // also tracks it for the viewer, otherwise the real (vanilla) copy would disappear.
+            boolean sameDimension = state.dimension != null && viewer.level.dimension().equals(state.dimension);
+            double rangeSq = vanillaTrackingRange(viewer);
+            rangeSq *= rangeSq;
+            ServerLevel level = viewer.getServer() == null || state.dimension == null ? null
+                    : viewer.getServer().getLevel(state.dimension);
+            List<Integer> toRemove = new ArrayList<>(state.entities.size());
             for (Integer id : state.entities.keySet()) {
-                ids[index++] = id;
+                Entity entity = level == null ? null : level.getEntity(id);
+                boolean vanillaHandlesIt = sameDimension && entity != null
+                        && viewer.distanceToSqr(entity) <= rangeSq;
+                if (!vanillaHandlesIt) {
+                    toRemove.add(id);
+                }
             }
-            viewer.connection.send(new ClientboundRemoveEntitiesPacket(ids));
+            if (!toRemove.isEmpty()) {
+                int[] ids = new int[toRemove.size()];
+                for (int i = 0; i < ids.length; i++) {
+                    ids[i] = toRemove.get(i);
+                }
+                viewer.connection.send(new ClientboundRemoveEntitiesPacket(ids));
+            }
         }
         state.entities.clear();
     }
@@ -919,17 +1228,19 @@ if (ey < viewer.getLevel().getMinBuildHeight() || ey >= viewer.getLevel().getMax
             }
         }
     }
+    /** Distance within which vanilla's own player tracker already sends an entity to this viewer. */
+    private static double vanillaTrackingRange(ServerPlayer viewer) {
+        MinecraftServer server = viewer.getServer();
+        int viewDistance = server == null ? 10 : server.getPlayerList().getViewDistance();
+        int limit = Math.min(EntityType.PLAYER.clientTrackingRange() * 16, Math.max(1, viewDistance - 1) * 16);
+        return Math.max(8.0D, limit);
+    }
+
     private static boolean isVanillaTracked(ServerPlayer viewer, ServerPlayer target) {
         if (viewer.level != target.level) {
             return false;
         }
-        MinecraftServer server = viewer.getServer();
-        if (server == null) {
-            return false;
-        }
-        int viewDistance = server.getPlayerList().getViewDistance();
-        int limit = Math.min(EntityType.PLAYER.clientTrackingRange() * 16, Math.max(1, viewDistance - 1) * 16);
-        double range = Math.max(8.0D, limit);
+        double range = vanillaTrackingRange(viewer);
         return viewer.distanceToSqr(target) <= range * range;
     }
 

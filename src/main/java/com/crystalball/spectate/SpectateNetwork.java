@@ -18,13 +18,15 @@ import com.crystalball.CrystalBallMod;
  * <ul>
  *     <li>{@link SpectateActionMessage} client -&gt; server: alpha / beta pressed while the orb is in
  *     hand (or while the camera is already looking through somebody else).</li>
+ *     <li>{@link SpectateClientConfigMessage} client -&gt; server: the streaming limits this client
+ *     accepts (client half of the configuration).</li>
  *     <li>{@link SpectateStateMessage} server -&gt; client: which player the camera should follow.</li>
  * </ul>
  */
 @Mod.EventBusSubscriber(modid = CrystalBallMod.MODID, bus = Mod.EventBusSubscriber.Bus.MOD)
 public final class SpectateNetwork {
 
-    private static final String PROTOCOL_VERSION = "1";
+    private static final String PROTOCOL_VERSION = "3";
 
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             new ResourceLocation(CrystalBallMod.MODID, "spectate"), () -> PROTOCOL_VERSION, PROTOCOL_VERSION::equals,
@@ -41,6 +43,10 @@ public final class SpectateNetwork {
                 SpectateChunkRequestMessage::decode, SpectateChunkRequestMessage::handle);
         CHANNEL.registerMessage(3, SpectateEntityRequestMessage.class, SpectateEntityRequestMessage::encode,
                 SpectateEntityRequestMessage::decode, SpectateEntityRequestMessage::handle);
+        CHANNEL.registerMessage(4, SpectateClientConfigMessage.class, SpectateClientConfigMessage::encode,
+                SpectateClientConfigMessage::decode, SpectateClientConfigMessage::handle);
+        CHANNEL.registerMessage(5, SpectateStreamedEntitiesMessage.class, SpectateStreamedEntitiesMessage::encode,
+                SpectateStreamedEntitiesMessage::decode, SpectateStreamedEntitiesMessage::handle);
         CHANNEL.registerMessage(1, SpectateStateMessage.class, SpectateStateMessage::encode, SpectateStateMessage::decode,
                 SpectateStateMessage::handle);
     }
@@ -58,6 +64,16 @@ public final class SpectateNetwork {
     /** Client side helper: tells the server whether the watched player's entity reached this client. */
     public static void sendEntityStatus(int action) {
         CHANNEL.sendToServer(new SpectateEntityRequestMessage(action));
+    }
+
+    /** Client side helper: tells the server which streaming limits this client accepts. */
+    public static void sendClientCaps(int entityRadius, int maxStreamedEntities) {
+        CHANNEL.sendToServer(new SpectateClientConfigMessage(entityRadius, maxStreamedEntities));
+    }
+
+    /** Server side helper: tells a viewer which entities are currently streamed for its session. */
+    public static void sendStreamedEntities(ServerPlayer player, int[] entityIds) {
+        CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), new SpectateStreamedEntitiesMessage(entityIds));
     }
 
     /** Server side helper: updates the camera state of a single viewer. */
